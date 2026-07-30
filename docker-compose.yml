@@ -1,0 +1,68 @@
+# Docker Compose — API + Nginx Reverse Proxy
+# Uso:
+#   docker compose build
+#   docker compose up -d
+#   docker compose down
+
+services:
+  # API
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: challenge-api
+    environment:
+      - PORT=3000
+      - NODE_ENV=production
+    networks:
+      - app-network
+    restart: unless-stopped
+    # Límites de recursos
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
+        reservations:
+          cpus: "0.25"
+          memory: 128M
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:3000/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  # Nginx
+  nginx:
+    build:
+      context: ./nginx
+      dockerfile: Dockerfile
+    container_name: challenge-nginx
+    ports:
+      - "80:80"
+    networks:
+      - app-network
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "0.25"
+          memory: 128M
+        reservations:
+          cpus: "0.1"
+          memory: 64M
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost/nginx-health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+
+# Networks
+networks:
+  app-network:
+    driver: bridge
