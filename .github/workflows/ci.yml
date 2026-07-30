@@ -1,0 +1,246 @@
+# CI/CD Pipeline — Challenge Urbetrack
+# Valida que la solución pueda construirse y ejecutarse correctamente.
+#
+# Etapas:
+#   1. Checkout + cache
+#   2. Build de la app (TypeScript)
+#   3. Build de imágenes Docker
+#   4. Validación de Docker Compose
+#   5. Levantamiento del entorno
+#   6. Healthcheck real contra la API
+#   7. Tests funcionales (requests válidos e inválidos)
+#   8. Cleanup
+
+name: CI Pipeline
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+env:
+  NODE_VERSION: "22"
+  IMAGE_TAG: ${{ github.sha }}
+
+jobs:
+  # Job 1: Build & Lint
+  build:
+    name: Build & Validate
+    runs-on: ubuntu-latest
+
+    steps:
+      # 1. Checkout
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # 2. Setup Node.js
+      - name: Setup Node.js ${{ env.NODE_VERSION }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: "npm"
+
+      # 3. Instalar dependencias
+      - name: Install dependencies
+        run: npm ci
+
+      # 4. Type check (compilación TypeScript)
+      - name: TypeScript type check
+        run: npm run typecheck
+
+      # 5. Build de la app
+      - name: Build application
+        run: npm run build
+
+      # 6. Verificar que dist/ se generó correctamente
+      - name: Verify build output
+        run: |
+          test -f dist/server.js || (echo "dist/server.js not found" && exit 1)
+          test -f dist/app.js || (echo "dist/app.js not found" && exit 1)
+          echo "Build output verified"
+
+  # ===========================================================================
+  # Job 2: Docker Build & Integration Tests
+  # ===========================================================================
+  docker:
+    name: Docker Build & Integration Tests
+    runs-on: ubuntu-latest
+    needs: build
+
+    steps:
+      # 1. Checkout
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # 2. Setup Docker Buildx
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # 3. Cache de Docker layers
+      - name: Cache Docker layers
+        uses: actions/cache@v4
+        with:
+          path: /tmp/.buildx-cache
+          key: ${{ runner.os }}-docker-${{ hashFiles('**/Dockerfile', '**/package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-docker-
+
+      # 4. Validar Docker Compose config
+      - name: Validate Docker Compose configuration
+        run: docker compose config --quiet
+
+      # 5. Build de imágenes Docker
+      - name: Build Docker images
+        run: docker compose build
+
+      # 6. Levantar el entorno
+      - name: Start services
+        run: docker compose up -d
+
+      # 7. Esperar a que los servicios estén healthy
+      - name: Wait for services to be healthy
+        run: |
+          echo "Waiting for services to become healthy..."
+          TIMEOUT=60
+          ELAPSED=0
+
+          while [ $ELAPSED -lt $TIMEOUT ]; do
+            API_HEALTH=$(docker inspect --format='{{.State.Health.Status}}' challenge-api 2>/dev/null || echo "starting")
+            NGINX_HEALTH=$(docker inspect --format='{{.State.Health.Status}}' challenge-nginx 2>/dev/null || echo "starting")
+
+            echo "  API: $API_HEALTH | Nginx: $NGINX_HEALTH (${ELAPSED}s)"
+
+            if [ "$API_HEALTH" = "healthy" ] && [ "$NGINX_HEALTH" = "healthy" ]; then
+              echo "All services are healthy!"
+              exit 0
+            fi
+
+            sleep 3
+            ELAPSED=$((ELAPSED + 3))
+          done
+
+          echo "Timeout waiting for services"
+          docker compose ps
+          docker compose logs
+          exit 1
+
+      # 8. Healthcheck real contra la API
+      - name: Healthcheck - GET /health
+        run: |
+          echo "Testing GET /health..."
+          RESPONSE=$(curl -s -w "\n%{http_code}" http://localhost/health)
+          HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+          BODY=$(echo "$RESPONSE" | head -1)
+
+          echo "HTTP Code: $HTTP_CODE"
+          echo "Response: $BODY"
+
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "Healthcheck failed with HTTP $HTTP_CODE"
+            exit 1
+          fi
+
+          echo "$BODY" | grep -q '"status":"ok"' || (echo "Invalid response body" && exit 1)
+          echo "Healthcheck passed"
+
+      # 9. Test funcional — Request válido a /validate-md5
+      - name: Test valid MD5 request
+        run: |
+          echo "Testing POST /validate-md5 with valid MD5..."
+
+          # MD5 de {"key":"value"} (serialización canónica) = a7353f7cddce808de0032747a0b7be50
+          RESPONSE=$(curl -s -w "\n%{http_code}" \
+            -X POST http://localhost/validate-md5 \
+            -H "Content-Type: application/json" \
+            -d '{"json_body":{"key":"value"},"md5":"a7353f7cddce808de0032747a0b7be50"}')
+
+          HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+          BODY=$(echo "$RESPONSE" | head -1)
+
+          echo "HTTP Code: $HTTP_CODE"
+          echo "Response: $BODY"
+
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "Expected HTTP 200, got $HTTP_CODE"
+            exit 1
+          fi
+
+          echo "$BODY" | grep -q '"valid":true' || (echo "Expected valid:true" && exit 1)
+          echo "Valid MD5 test passed"
+
+      # 10. Test funcional — Request inválido (MD5 incorrecto)
+      - name: Test invalid MD5 request
+        run: |
+          echo "Testing POST /validate-md5 with invalid MD5..."
+
+          RESPONSE=$(curl -s -w "\n%{http_code}" \
+            -X POST http://localhost/validate-md5 \
+            -H "Content-Type: application/json" \
+            -d '{"json_body":{"key":"value"},"md5":"00000000000000000000000000000000"}')
+
+          HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+          BODY=$(echo "$RESPONSE" | head -1)
+
+          echo "HTTP Code: $HTTP_CODE"
+          echo "Response: $BODY"
+
+          if [ "$HTTP_CODE" != "422" ]; then
+            echo "Expected HTTP 422, got $HTTP_CODE"
+            exit 1
+          fi
+
+          echo "$BODY" | grep -q '"error":"MD5 Mismatch"' || (echo "Expected MD5 Mismatch error" && exit 1)
+          echo "Invalid MD5 test passed"
+
+      # 11. Test funcional — Request con campos faltantes
+      - name: Test missing fields request
+        run: |
+          echo "Testing POST /validate-md5 with missing fields..."
+
+          RESPONSE=$(curl -s -w "\n%{http_code}" \
+            -X POST http://localhost/validate-md5 \
+            -H "Content-Type: application/json" \
+            -d '{"json_body":{"key":"value"}}')
+
+          HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+          BODY=$(echo "$RESPONSE" | head -1)
+
+          echo "HTTP Code: $HTTP_CODE"
+          echo "Response: $BODY"
+
+          if [ "$HTTP_CODE" != "400" ]; then
+            echo "Expected HTTP 400, got $HTTP_CODE"
+            exit 1
+          fi
+
+          echo "Missing fields test passed"
+
+      # 12. Test — Swagger UI accesible
+      - name: Test Swagger UI availability
+        run: |
+          echo "Testing GET /api-docs..."
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" http://localhost/api-docs/)
+
+          if [ "$HTTP_CODE" != "200" ] && [ "$HTTP_CODE" != "301" ]; then
+            echo "Swagger UI not accessible (HTTP $HTTP_CODE)"
+            exit 1
+          fi
+
+          echo "Swagger UI is accessible"
+
+      - name: Show logs on failure
+        if: failure()
+        run: |
+          echo "=== Docker Compose Status ==="
+          docker compose ps
+          echo ""
+          echo "=== API Logs ==="
+          docker compose logs api
+          echo ""
+          echo "=== Nginx Logs ==="
+          docker compose logs nginx
+
+      - name: Cleanup
+        if: always()
+        run: docker compose down --remove-orphans
